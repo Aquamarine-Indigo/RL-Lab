@@ -13,6 +13,7 @@ import random
 import time
 import datetime
 from tqdm import tqdm
+import joblib
 
 from rl_models import ActorCritic_Continuous, make_agent
 
@@ -36,11 +37,11 @@ def parse_args():
 	# 					help='the id of the gym environment')
 	parser.add_argument('--gym-id', type=str, default='Ant-v4',
 						help='the id of the gym environment')
-	parser.add_argument('--total-timesteps', type=int, default=2000000,
+	parser.add_argument('--total-timesteps', type=int, default=20000000,
 						help='total timesteps of the experiments')
 	parser.add_argument('--learning-rate', type=float, default=3e-4,
 						help='the learning rate of the optimizer')
-	parser.add_argument('--num-envs', type=int, default=1,
+	parser.add_argument('--num-envs', type=int, default=4,
 						help='the number of parallel game environments')
 	parser.add_argument('--torch-deterministic', type=lambda x: bool(strtobool(x)), default=True,
 						help='whether to set `torch.backends.cudnn.deterministic=True`')
@@ -100,7 +101,7 @@ def make_continuous_env(gym_id, seed, idx, capture_video, run_name):
 		env = gym.wrappers.RecordEpisodeStatistics(env)
 		if capture_video:
 			if idx == 0:
-				env = gym.wrappers.RecordVideo(env, f'videos/{run_name}', episode_trigger = lambda x: (x+1) % (200) == 0)
+				env = gym.wrappers.RecordVideo(env, f'videos/{run_name}', episode_trigger = lambda x: (x+1) % (2000) == 0)
 		# env.seed(seed)
 		env = gym.wrappers.ClipAction(env)
 		env = gym.wrappers.NormalizeObservation(env)
@@ -114,7 +115,11 @@ def make_continuous_env(gym_id, seed, idx, capture_video, run_name):
 
 
 def ppo_continuous_main(args, envs, device):
-	agent = make_agent(envs, agent_type='actor-critic-continuous', device=device)
+	layers = [
+		[256, 128, 64],
+		[256, 128, 64]
+	]
+	agent = make_agent(envs, agent_type='actor-critic-continuous', device=device, layers=layers)
 	adam_epsilon = 1e-5
 	optimizer = torch.optim.Adam(agent.parameters(), lr=args.learning_rate, eps=adam_epsilon)
 
@@ -276,6 +281,8 @@ def ppo_continuous_main(args, envs, device):
 				"loss/clip_frac": np.mean(clip_fracs),
 				"rewards/mean_reward": rewards.mean().item(),
 				"actions/action_mean_abs": actions.abs().mean().item(),
+				"loss/advantage_mean": advantages.mean().item(),
+				"loss/advantage_std": advantages.std().item(),
 			}
 			wandb.log(writer_info, step=global_step)
 	envs.close()
@@ -314,3 +321,4 @@ if __name__ == '__main__':
 	# 			print(item["episode"])
 	# print(envs)
 	agent = ppo_continuous_main(args, envs, device)
+	joblib.dump(agent, f"models/{run_name}.pkl")
