@@ -3,6 +3,8 @@ import os
 import gym
 import gym.wrappers
 import gym.wrappers
+import gym.wrappers
+import gym.wrappers
 import numpy as np
 import wandb
 import torch
@@ -12,7 +14,7 @@ import time
 import datetime
 from tqdm import tqdm
 
-from rl_models import make_agent
+from rl_models import ActorCritic_Continuous, make_agent
 
 current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -30,13 +32,15 @@ def parse_args():
 						help='the name of this experiment')
 	parser.add_argument('--seed', type=int, default=1,
 						help='seed of the experiment')
-	parser.add_argument('--gym-id', type=str, default='CartPole-v1',
+	# parser.add_argument('--gym-id', type=str, default='HumanoidStandup-v4',
+	# 					help='the id of the gym environment')
+	parser.add_argument('--gym-id', type=str, default='Ant-v4',
 						help='the id of the gym environment')
-	parser.add_argument('--total-timesteps', type=int, default=25000,
+	parser.add_argument('--total-timesteps', type=int, default=2000000,
 						help='total timesteps of the experiments')
-	parser.add_argument('--learning-rate', type=float, default=2.5e-4,
+	parser.add_argument('--learning-rate', type=float, default=3e-4,
 						help='the learning rate of the optimizer')
-	parser.add_argument('--num-envs', type=int, default=4,
+	parser.add_argument('--num-envs', type=int, default=1,
 						help='the number of parallel game environments')
 	parser.add_argument('--torch-deterministic', type=lambda x: bool(strtobool(x)), default=True,
 						help='whether to set `torch.backends.cudnn.deterministic=True`')
@@ -50,7 +54,7 @@ def parse_args():
 						help="the entity (team) of wandb's project")
 	parser.add_argument('--capture-video', type=lambda x: bool(strtobool(x)), default=True,
 						help='whether to capture videos of the agent performances (check out `videos` folder)')
-	parser.add_argument('--num_steps', type=int, default=128,
+	parser.add_argument('--num_steps', type=int, default=2048,
 						help='number of steps to run the agent in each environment in each rollout')
 	parser.add_argument('--anneal-lr', type=lambda x: bool(strtobool(x)), default=True,
 						help='whether to anneal the learning rate during training')
@@ -60,9 +64,9 @@ def parse_args():
 						help='the discount factor gamma')
 	parser.add_argument('--gae-lambda', type=float, default=0.95,
 						help='the lambda for the general advantage estimation')
-	parser.add_argument('--num-minibatches', type=int, default=4,
+	parser.add_argument('--num-minibatches', type=int, default=32,
 						help='the number of mini-batches')
-	parser.add_argument('--update-epochs', type=int, default=2,
+	parser.add_argument('--update-epochs', type=int, default=10,
 						help='the K epochs to update the policy')
 	parser.add_argument('--norm-adv', type=lambda x: bool(strtobool(x)), default=True,
 						help='whether to normalize the advantage')
@@ -70,7 +74,7 @@ def parse_args():
 						help='the epsilon to use for the surrogate objective')
 	parser.add_argument('--clip-vloss', type=lambda x: bool(strtobool(x)), default=True,
 						help='whether to use a clipped loss for the value function, as per the paper')
-	parser.add_argument('--ent-coef', type=float, default=0.01,
+	parser.add_argument('--ent-coef', type=float, default=0.0,
 						help='coefficient of the entropy')
 	parser.add_argument('--vf-coef', type=float, default=0.5,
 						help='coefficient of the value function')
@@ -90,22 +94,27 @@ def init_seeds(args):
 	random.seed(args.seed)
 	torch.backends.cudnn.deterministic = args.torch_deterministic
 
-def make_env(gym_id, seed, idx, capture_video, run_name):
+def make_continuous_env(gym_id, seed, idx, capture_video, run_name):
 	def thunk():
 		env = gym.make(gym_id, render_mode='rgb_array')
 		env = gym.wrappers.RecordEpisodeStatistics(env)
 		if capture_video:
 			if idx == 0:
-				env = gym.wrappers.RecordVideo(env, f'videos/{run_name}', episode_trigger = lambda x: (x+1) % (50) == 0)
+				env = gym.wrappers.RecordVideo(env, f'videos/{run_name}', episode_trigger = lambda x: (x+1) % (200) == 0)
 		# env.seed(seed)
+		env = gym.wrappers.ClipAction(env)
+		env = gym.wrappers.NormalizeObservation(env)
+		env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+		env = gym.wrappers.NormalizeReward(env)
+		env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
 		env.action_space.seed(seed)
 		env.observation_space.seed(seed)
 		return env
 	return thunk
 
 
-def ppo_main(args, envs, device):
-	agent = make_agent(envs, agent_type='actor-critic-discrete', device=device)
+def ppo_continuous_main(args, envs, device):
+	agent = make_agent(envs, agent_type='actor-critic-continuous', device=device)
 	adam_epsilon = 1e-5
 	optimizer = torch.optim.Adam(agent.parameters(), lr=args.learning_rate, eps=adam_epsilon)
 
@@ -115,6 +124,7 @@ def ppo_main(args, envs, device):
 	dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
 	values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 	log_probs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+	print(f"actions shape: {actions.shape}, rewards shape: {rewards.shape}")
 
 	global_step = 0
 	start_time = time.time()
@@ -144,14 +154,15 @@ def ppo_main(args, envs, device):
 			next_obs, reward, next_done, next_truncated, infos = envs.step(action.cpu().numpy().astype(np.int32))
 			rewards[step] = torch.Tensor(reward).to(device).view(-1)
 			next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
-			if infos.get('final_info') is not None:
-				for item in infos.get('final_info'):
-					if item is not None and "episode" in item.keys():
-						if args.track:
-							wandb.log({
-								"episode/episodic_return": item["episode"]["r"],
-								"episode/episodic_length": item["episode"]["l"],
-							}, step=global_step)
+			# print(infos, rewards.shape, rewards.mean())
+			# if infos.get('final_info') is not None:
+			# 	for item in infos.get('final_info'):
+			# 		if item is not None and "episode" in item.keys():
+			# 			if args.track:
+			# 				wandb.log({
+			# 					"episode/episodic_return": item["episode"]["r"],
+			# 					"episode/episodic_length": item["episode"]["l"],
+			# 				}, step=global_step)
 
 		# Generalized Advantage Estimataion
 		with torch.no_grad():
@@ -198,7 +209,7 @@ def ppo_main(args, envs, device):
 				end = start + args.minibatch_size
 				minibatch_ind = batch_indexes[start:end]
 				_, new_logprob, entropy, new_values = agent.get_action_and_value(
-					batch_obs[minibatch_ind], batch_actions.long()[minibatch_ind]
+					batch_obs[minibatch_ind], batch_actions[minibatch_ind]
 				) # action is None
 				logratio = new_logprob - batch_log_probs[minibatch_ind]
 				ratio = logratio.exp()
@@ -250,6 +261,7 @@ def ppo_main(args, envs, device):
 		y_pred, y_true = batch_values.cpu().numpy(), batch_returns.cpu().numpy()
 		var_y = np.var(y_true)
 		explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+		# print("actions: ", actions.abs().mean().item())
 
 		if args.track:
 			writer_info = {
@@ -261,7 +273,9 @@ def ppo_main(args, envs, device):
 				"loss/explained_var": explained_var,
 				"charts/learning_rate": optimizer.param_groups[0]["lr"],
 				"charts/entropy": entropy.mean().item(),
-				"loss/clip_frac": np.mean(clip_fracs)
+				"loss/clip_frac": np.mean(clip_fracs),
+				"rewards/mean_reward": rewards.mean().item(),
+				"actions/action_mean_abs": actions.abs().mean().item(),
 			}
 			wandb.log(writer_info, step=global_step)
 	envs.close()
@@ -283,8 +297,12 @@ if __name__ == '__main__':
 			save_code=True
 		)
 	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-	envs = gym.vector.SyncVectorEnv([make_env(args.gym_id, args.seed+i, i, args.capture_video, run_name) for i in range(args.num_envs)])
-	print("action space single", envs.single_action_space.n)
+	envs = gym.vector.SyncVectorEnv([
+		make_continuous_env(args.gym_id, args.seed+i, i, args.capture_video, run_name) for i in range(args.num_envs)
+	])
+	assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+
+	print("action space single", envs.single_action_space.shape)
 	print("observation space shape", envs.single_observation_space.shape)
 	observation = envs.reset()
 	# for _ in range(200):
@@ -295,4 +313,4 @@ if __name__ == '__main__':
 	# 		if "episode" in item:
 	# 			print(item["episode"])
 	# print(envs)
-	agent = ppo_main(args, envs, device)
+	agent = ppo_continuous_main(args, envs, device)
